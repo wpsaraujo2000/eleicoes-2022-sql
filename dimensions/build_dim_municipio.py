@@ -1,30 +1,17 @@
 """
 FASE 1 — construção da dimensão municipal.
 
-Objetivos desta etapa:
-- carregar a tabela de correspondência TSE ↔ IBGE;
+Objetivos:
+- carregar a correspondência TSE ↔ IBGE;
 - carregar atributos da malha municipal de 2024;
-- padronizar códigos municipais;
+- padronizar códigos;
 - corrigir divergências conhecidas;
-- remover registros que não representam municípios;
-- relacionar TSE e IBGE;
-- validar a correspondência entre as fontes.
+- remover registros que não são municípios;
+- criar o merge TSE ↔ IBGE ↔ geografia;
+- validar o resultado.
 
-IMPORTANTE
-----------
-A camada RAW nunca é alterada.
-
-Nesta etapa ainda NÃO fazemos:
-- gravação no S3;
-- geração de Parquet;
-- latitude/longitude;
-- microrregião/mesorregião da classificação antiga.
-
-Destino futuro:
-    s3://eleicoes-sql-2022/silver/dim_municipio/
+Nesta etapa ainda NÃO gravamos dados no S3.
 """
-
-from __future__ import annotations
 
 from io import StringIO
 
@@ -49,34 +36,25 @@ SHAPEFILE_PATH = (
     "BR_Municipios_2024.shp"
 )
 
-
-# Códigos presentes na malha, mas que não representam municípios
+# Registros da malha que não são municípios
 CODIGOS_NAO_MUNICIPAIS = [
     "4300001",  # Área Operacional Lagoa Mirim
     "4300002",  # Área Operacional Lagoa dos Patos
 ]
 
-
-# Correções conhecidas na tabela TSE ↔ IBGE
-CORRECOES_CODIGO_IBGE = {
+# Correções conhecidas
+CORRECOES_IBGE = {
     # Boa Esperança do Norte - MT
     "5300109": "5101837",
 }
 
 
 # ============================================================
-# 1. CARREGAMENTO TSE ↔ IBGE
+# 1. TABELA TSE ↔ IBGE
 # ============================================================
 
 def carregar_municipios_tse() -> pd.DataFrame:
-    """
-    Lê a tabela de correspondência TSE ↔ IBGE diretamente do S3.
-
-    Retorna
-    -------
-    pd.DataFrame
-        Base original da correspondência municipal.
-    """
+    """Carrega a tabela TSE ↔ IBGE diretamente do S3."""
 
     s3 = boto3.client(
         "s3",
@@ -88,7 +66,6 @@ def carregar_municipios_tse() -> pd.DataFrame:
         Key=S3_MUNICIPIO_TSE_IBGE,
     )
 
-    # O arquivo foi identificado anteriormente como Latin-1.
     texto = resposta["Body"].read().decode("latin1")
 
     df = pd.read_csv(
@@ -100,23 +77,10 @@ def carregar_municipios_tse() -> pd.DataFrame:
     return df
 
 
-# ============================================================
-# 2. TRATAMENTO TSE ↔ IBGE
-# ============================================================
-
 def tratar_municipios_tse(
-    df: pd.DataFrame,
+    df: pd.DataFrame
 ) -> pd.DataFrame:
-    """
-    Padroniza a tabela TSE ↔ IBGE.
-
-    Operações:
-    - mantém somente colunas necessárias;
-    - remove espaços;
-    - padroniza códigos;
-    - corrige divergências conhecidas;
-    - valida unicidade do código TSE.
-    """
+    """Padroniza e corrige a tabela TSE ↔ IBGE."""
 
     colunas = [
         "CD_MUNICIPIO_TSE",
@@ -126,145 +90,56 @@ def tratar_municipios_tse(
         "SG_UF",
     ]
 
-    faltantes = [
-        coluna
-        for coluna in colunas
-        if coluna not in df.columns
-    ]
-
-    if faltantes:
-        raise ValueError(
-            f"Colunas ausentes na tabela TSE ↔ IBGE: {faltantes}"
-        )
-
     df = df[colunas].copy()
 
-    # --------------------------------------------------------
-    # Limpeza textual
-    # --------------------------------------------------------
-
-    for coluna in [
-        "CD_MUNICIPIO_TSE",
-        "CD_MUNICIPIO_IBGE",
-        "NM_MUNICIPIO_TSE",
-        "NM_MUNICIPIO_IBGE",
-        "SG_UF",
-    ]:
+    for coluna in colunas:
         df[coluna] = (
             df[coluna]
             .astype("string")
             .str.strip()
         )
 
-    # --------------------------------------------------------
-    # Código TSE
-    # --------------------------------------------------------
-
-    df["CD_MUNICIPIO_TSE"] = (
-        df["CD_MUNICIPIO_TSE"]
-        .str.replace(r"\.0$", "", regex=True)
-    )
-
-    # --------------------------------------------------------
-    # Código IBGE
-    # --------------------------------------------------------
-
     df["CD_MUNICIPIO_IBGE"] = (
         df["CD_MUNICIPIO_IBGE"]
         .str.replace(r"\.0$", "", regex=True)
         .str.zfill(7)
+        .replace(CORRECOES_IBGE)
     )
-
-    # --------------------------------------------------------
-    # Correções conhecidas
-    # --------------------------------------------------------
-
-    df["CD_MUNICIPIO_IBGE"] = (
-        df["CD_MUNICIPIO_IBGE"]
-        .replace(CORRECOES_CODIGO_IBGE)
-    )
-
-    # --------------------------------------------------------
-    # Validação
-    # --------------------------------------------------------
-
-    duplicados_tse = (
-        df["CD_MUNICIPIO_TSE"]
-        .duplicated()
-        .sum()
-    )
-
-    if duplicados_tse > 0:
-        raise ValueError(
-            f"Foram encontrados {duplicados_tse} "
-            "códigos TSE duplicados."
-        )
-
-    duplicados_ibge = (
-        df["CD_MUNICIPIO_IBGE"]
-        .duplicated()
-        .sum()
-    )
-
-    if duplicados_ibge > 0:
-        raise ValueError(
-            f"Foram encontrados {duplicados_ibge} "
-            "códigos IBGE duplicados após tratamento."
-        )
 
     return df
 
 
 # ============================================================
-# 3. CARREGAMENTO DA MALHA MUNICIPAL
+# 2. MALHA MUNICIPAL
 # ============================================================
 
 def carregar_malha_municipal() -> pd.DataFrame:
-    """
-    Lê somente os atributos necessários da malha municipal.
-
-    A geometria não é carregada nesta etapa para reduzir
-    consumo de memória e transferência de dados.
-    """
-
-    colunas = [
-        "CD_MUN",
-        "NM_MUN",
-        "SIGLA_UF",
-        "AREA_KM2",
-        "CD_RGI",
-        "NM_RGI",
-        "CD_RGINT",
-        "NM_RGINT",
-        "CD_REGIA",
-        "NM_REGIA",
-    ]
+    """Carrega somente atributos da malha, sem geometria."""
 
     df = pyogrio.read_dataframe(
         SHAPEFILE_PATH,
-        columns=colunas,
+        columns=[
+            "CD_MUN",
+            "NM_MUN",
+            "SIGLA_UF",
+            "AREA_KM2",
+            "CD_RGI",
+            "NM_RGI",
+            "CD_RGINT",
+            "NM_RGINT",
+            "CD_REGIA",
+            "NM_REGIA",
+        ],
         read_geometry=False,
     )
 
     return df
 
 
-# ============================================================
-# 4. TRATAMENTO DA MALHA
-# ============================================================
-
 def tratar_malha_municipal(
-    df: pd.DataFrame,
+    df: pd.DataFrame
 ) -> pd.DataFrame:
-    """
-    Padroniza a malha municipal.
-
-    Operações:
-    - padroniza código IBGE;
-    - remove áreas não municipais;
-    - padroniza textos;
-    - valida unicidade municipal.
-    """
+    """Padroniza a malha e remove registros não municipais."""
 
     df = df.copy()
 
@@ -272,13 +147,8 @@ def tratar_malha_municipal(
         df["CD_MUN"]
         .astype("string")
         .str.strip()
-        .str.replace(r"\.0$", "", regex=True)
         .str.zfill(7)
     )
-
-    # --------------------------------------------------------
-    # Remover áreas que não representam municípios
-    # --------------------------------------------------------
 
     df = df[
         ~df["CD_MUN"].isin(
@@ -286,74 +156,19 @@ def tratar_malha_municipal(
         )
     ].copy()
 
-    # --------------------------------------------------------
-    # Padronização textual
-    # --------------------------------------------------------
-
-    colunas_texto = [
-        "NM_MUN",
-        "SIGLA_UF",
-        "CD_RGI",
-        "NM_RGI",
-        "CD_RGINT",
-        "NM_RGINT",
-        "CD_REGIA",
-        "NM_REGIA",
-    ]
-
-    for coluna in colunas_texto:
-        if coluna in df.columns:
-            df[coluna] = (
-                df[coluna]
-                .astype("string")
-                .str.strip()
-            )
-
-    # --------------------------------------------------------
-    # Área municipal
-    # --------------------------------------------------------
-
-    df["AREA_KM2"] = pd.to_numeric(
-        df["AREA_KM2"],
-        errors="coerce",
-    )
-
-    # --------------------------------------------------------
-    # Validação
-    # --------------------------------------------------------
-
-    duplicados = (
-        df["CD_MUN"]
-        .duplicated()
-        .sum()
-    )
-
-    if duplicados > 0:
-        raise ValueError(
-            f"Foram encontrados {duplicados} "
-            "códigos municipais duplicados na malha."
-        )
-
     return df
 
 
 # ============================================================
-# 5. CRIAÇÃO DA DIMENSÃO
+# 3. CRIAÇÃO DA DIMENSÃO
 # ============================================================
 
 def criar_dim_municipio(
     tse: pd.DataFrame,
-    geo: pd.DataFrame,
+    geo: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Junta a tabela TSE ↔ IBGE com a malha municipal.
-
-    O relacionamento é feito por:
-
-        CD_MUNICIPIO_IBGE = CD_MUN
-
-    Como ambas as bases devem possuir uma linha por município,
-    o merge é validado como one_to_one.
+    Relaciona TSE e geografia usando o código IBGE.
     """
 
     dim = tse.merge(
@@ -365,51 +180,34 @@ def criar_dim_municipio(
         indicator=True,
     )
 
-    # --------------------------------------------------------
-    # Validar municípios sem correspondência
-    # --------------------------------------------------------
-
-    sem_correspondencia = dim[
+    # Verificar falhas no relacionamento
+    sem_geo = dim[
         dim["_merge"] != "both"
     ]
 
-    if not sem_correspondencia.empty:
-        colunas_erro = [
-            "CD_MUNICIPIO_TSE",
-            "CD_MUNICIPIO_IBGE",
-            "NM_MUNICIPIO_TSE",
-            "_merge",
-        ]
-
-        raise ValueError(
-            "Existem municípios sem correspondência geográfica:\n"
-            + sem_correspondencia[
-                colunas_erro
+    if not sem_geo.empty:
+        print("\nMunicípios sem geografia:")
+        print(
+            sem_geo[
+                [
+                    "CD_MUNICIPIO_TSE",
+                    "CD_MUNICIPIO_IBGE",
+                    "NM_MUNICIPIO_TSE",
+                ]
             ].to_string(index=False)
         )
 
-    dim = dim.drop(
-        columns=[
-            "_merge",
-            "CD_MUN",
-        ]
-    )
+        raise ValueError(
+            "Existem municípios sem correspondência geográfica."
+        )
 
-    # --------------------------------------------------------
-    # Nome e UF oficiais da dimensão
-    # --------------------------------------------------------
-
+    # Nome municipal oficial da dimensão
     dim["NM_MUNICIPIO"] = dim["NM_MUN"]
 
-    dim["SG_UF"] = (
-        dim["SIGLA_UF"]
-        .fillna(dim["SG_UF"])
-    )
+    # Mantemos a UF da malha após validação
+    dim["SG_UF"] = dim["SIGLA_UF"]
 
-    # --------------------------------------------------------
-    # Renomear atributos geográficos modernos
-    # --------------------------------------------------------
-
+    # Renomear regiões modernas
     dim = dim.rename(
         columns={
             "CD_RGI": "CD_REGIAO_IMEDIATA",
@@ -420,10 +218,6 @@ def criar_dim_municipio(
             "NM_REGIA": "NM_REGIAO",
         }
     )
-
-    # --------------------------------------------------------
-    # Seleção e ordenação
-    # --------------------------------------------------------
 
     colunas_finais = [
         "CD_MUNICIPIO_TSE",
@@ -439,39 +233,34 @@ def criar_dim_municipio(
         "NM_REGIAO",
     ]
 
-    dim = dim[
-        colunas_finais
-    ].copy()
-
-    dim = dim.sort_values(
-        [
-            "SG_UF",
-            "CD_MUNICIPIO_IBGE",
-        ]
-    ).reset_index(drop=True)
+    dim = (
+        dim[colunas_finais]
+        .sort_values(
+            [
+                "SG_UF",
+                "CD_MUNICIPIO_IBGE",
+            ]
+        )
+        .reset_index(drop=True)
+    )
 
     return dim
 
 
 # ============================================================
-# 6. VALIDAÇÃO FINAL
+# 4. VALIDAÇÃO
 # ============================================================
 
 def validar_dim_municipio(
-    dim: pd.DataFrame,
+    dim: pd.DataFrame
 ) -> None:
-    """
-    Executa verificações básicas de integridade da dimensão.
-    """
+    """Executa verificações básicas da dimensão."""
 
     print("\n" + "-" * 60)
     print("VALIDAÇÃO FINAL")
     print("-" * 60)
 
-    print(
-        "Registros:",
-        len(dim)
-    )
+    print("Registros:", len(dim))
 
     print(
         "Códigos TSE únicos:",
@@ -498,23 +287,9 @@ def validar_dim_municipio(
         dim["AREA_KM2"].isna().sum()
     )
 
-    print(
-        "Municípios sem região imediata:",
-        dim["CD_REGIAO_IMEDIATA"].isna().sum()
-    )
-
-    print(
-        "Municípios sem região intermediária:",
-        dim["CD_REGIAO_INTERMEDIARIA"].isna().sum()
-    )
-
-    # --------------------------------------------------------
-    # Regras críticas
-    # --------------------------------------------------------
-
     if len(dim) != 5571:
         raise ValueError(
-            f"Quantidade inesperada de municípios: {len(dim)}"
+            f"Quantidade inesperada: {len(dim)}"
         )
 
     if dim["CD_MUNICIPIO_TSE"].nunique() != 5571:
@@ -529,13 +304,12 @@ def validar_dim_municipio(
 
     if dim["SG_UF"].nunique() != 27:
         raise ValueError(
-            f"Quantidade inesperada de UFs: "
-            f"{dim['SG_UF'].nunique()}"
+            "Quantidade de UFs diferente de 27."
         )
 
 
 # ============================================================
-# 7. EXECUÇÃO
+# 5. EXECUÇÃO
 # ============================================================
 
 def main() -> None:
@@ -544,13 +318,7 @@ def main() -> None:
     print("FASE 1 - DIMENSÃO MUNICÍPIO")
     print("=" * 60)
 
-    # --------------------------------------------------------
-    # TSE
-    # --------------------------------------------------------
-
-    print(
-        "\n[1/4] Carregando tabela TSE ↔ IBGE..."
-    )
+    print("\n[1/4] Carregando tabela TSE ↔ IBGE...")
 
     tse = carregar_municipios_tse()
 
@@ -559,22 +327,14 @@ def main() -> None:
         len(tse)
     )
 
-    tse = tratar_municipios_tse(
-        tse
-    )
+    tse = tratar_municipios_tse(tse)
 
     print(
         "Registros após o tratamento:",
         len(tse)
     )
 
-    # --------------------------------------------------------
-    # MALHA
-    # --------------------------------------------------------
-
-    print(
-        "\n[2/4] Carregando malha municipal..."
-    )
+    print("\n[2/4] Carregando malha municipal...")
 
     geo = carregar_malha_municipal()
 
@@ -583,22 +343,14 @@ def main() -> None:
         len(geo)
     )
 
-    geo = tratar_malha_municipal(
-        geo
-    )
+    geo = tratar_malha_municipal(geo)
 
     print(
         "Registros após o tratamento:",
         len(geo)
     )
 
-    # --------------------------------------------------------
-    # MERGE
-    # --------------------------------------------------------
-
-    print(
-        "\n[3/4] Criando dimensão municipal..."
-    )
+    print("\n[3/4] Criando dimensão municipal...")
 
     dim = criar_dim_municipio(
         tse=tse,
@@ -610,21 +362,9 @@ def main() -> None:
         len(dim)
     )
 
-    # --------------------------------------------------------
-    # VALIDAÇÃO
-    # --------------------------------------------------------
+    print("\n[4/4] Validando dimensão...")
 
-    print(
-        "\n[4/4] Validando dimensão..."
-    )
-
-    validar_dim_municipio(
-        dim
-    )
-
-    # --------------------------------------------------------
-    # AMOSTRA
-    # --------------------------------------------------------
+    validar_dim_municipio(dim)
 
     print("\n" + "-" * 60)
     print("AMOSTRA")
@@ -637,13 +377,7 @@ def main() -> None:
     )
 
     print("\nProcesso concluído com sucesso.")
-
-    print(
-        "\nOBSERVAÇÃO:"
-        "\nA dimensão ainda não foi gravada no S3."
-        "\nA gravação em Parquet será adicionada"
-        "\nna próxima etapa."
-    )
+    print("Nenhum arquivo foi gravado no S3.")
 
 
 if __name__ == "__main__":
