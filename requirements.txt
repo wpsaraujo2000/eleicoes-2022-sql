@@ -1,0 +1,5 @@
+boto3>=1.34
+pandas>=2.2
+pyarrow>=17
+geopandas>=1.0
+geobr>=0.2
